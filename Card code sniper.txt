@@ -1,0 +1,1087 @@
+--[[
+    Cards code sniper
+    ONLY GUI changed to Card style
+    All original functions, riddle solver, retype, redeem logic kept 100%
+]]
+
+local cloneref = cloneref or function(object) return object end
+local Players           = cloneref(game:GetService("Players"))
+local ReplicatedStorage = cloneref(game:GetService("ReplicatedStorage"))
+local RunService        = cloneref(game:GetService("RunService"))
+local UserInputService  = cloneref(game:GetService("UserInputService"))
+local TweenService      = cloneref(game:GetService("TweenService"))
+local HttpService       = cloneref(game:GetService("HttpService"))
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+if getgenv and getgenv().StopAura then pcall(getgenv().StopAura) end
+
+-- CONFIGURATION SYSTEM --
+local CONFIG_FILE = "ace_code_sniper_auto_redeem_test_config.json"
+local savedConfig = {
+    codeSniper = true,
+    autoSubmit = true,
+    submitAfter = 3,
+    retypeInvalid = false,
+    riddleSolver = false,
+}
+pcall(function()
+    if type(isfile) == "function" and type(readfile) == "function"
+    and isfile(CONFIG_FILE) then
+        local decoded = HttpService:JSONDecode(readfile(CONFIG_FILE))
+        if type(decoded) == "table" then
+            if type(decoded.codeSniper) == "boolean" then savedConfig.codeSniper = decoded.codeSniper end
+            if type(decoded.autoSubmit) == "boolean" then savedConfig.autoSubmit = decoded.autoSubmit end
+            if type(decoded.submitAfter) == "number" then savedConfig.submitAfter = math.max(1, math.floor(decoded.submitAfter)) end
+            if type(decoded.retypeInvalid) == "boolean" then savedConfig.retypeInvalid = decoded.retypeInvalid end
+            if type(decoded.riddleSolver) == "boolean" then savedConfig.riddleSolver = decoded.riddleSolver end
+        end
+    end
+end)
+
+local function saveConfig()
+    if type(writefile) ~= "function" then return end
+    pcall(function()
+        writefile(CONFIG_FILE, HttpService:JSONEncode({
+            codeSniper = savedConfig.codeSniper,
+            autoSubmit = savedConfig.autoSubmit,
+            submitAfter = savedConfig.submitAfter,
+            retypeInvalid = savedConfig.retypeInvalid,
+            riddleSolver = savedConfig.riddleSolver,
+        }))
+    end)
+end
+
+-- STATE VARIABLES --
+local _enabled              = savedConfig.codeSniper
+local _seen                 = {}
+local _focused              = nil
+local _lastBox              = nil
+local _autoAccept           = savedConfig.autoSubmit
+local _submitAfter          = savedConfig.submitAfter
+local _capturedParts        = {}
+local _lastWatchedBox       = nil
+local _boxTextConn          = nil
+local _boxAncestryConn      = nil
+local _boxVisibilityConns   = {}
+local _retypeInvalid        = savedConfig.retypeInvalid
+local _riddleSolver         = savedConfig.riddleSolver
+local _lastNonBlankBoxText  = ""
+local _pendingRejectedText  = nil
+local _pendingRejectedBox   = nil
+local _pendingRejectedUntil = 0
+local _pendingRejectedToken = 0
+local ACE_CASE_MODE         = "EXACT"
+local ACE_WORD_COUNT        = 1
+
+local getupvalues = (debug and debug.getupvalues) or getupvalues
+local getconns    = getconnections or (debug and debug.getconnections)
+local setupv      = (debug and debug.setupvalue) or setupvalue
+
+local setStatus, flashCode, appendToBox
+local rememberPendingSubmission, clearPendingSubmission, handleRedemptionFeedback
+local clearAceCapture
+local _lastStatusMsg = nil
+
+-- UTILITY & REDEEM LOGIC --
+local function isOurGui(instance)
+    local p = instance
+    for _ = 1, 10 do
+        if not p then break end
+        if p.Name == "CardACECodeSniper" or p.Name == "ACECodeSniperUI" or p.Name == "SourcesHubRedeemerGui" then return true end
+        p = p.Parent
+    end
+    return false
+end
+
+local function isVisibleChain(inst)
+    local current = inst
+    while current do
+        if current:IsA("GuiObject") and not current.Visible then return false end
+        if current:IsA("ScreenGui") then return current.Enabled end
+        current = current.Parent
+    end
+    return true
+end
+
+local function findAllTextBoxes(pg)
+    local boxes = {}
+    for _, gui in ipairs(pg:GetChildren()) do
+        if gui:IsA("ScreenGui") and gui.Enabled and not isOurGui(gui) then
+            for _, d in ipairs(gui:GetDescendants()) do
+                if d:IsA("TextBox") and not isOurGui(d) then
+                    boxes[#boxes+1] = d
+                end
+            end
+        end
+    end
+    return boxes
+end
+
+local function findCodeButtons(pg)
+    local btns = {}
+    for _, gui in ipairs(pg:GetChildren()) do
+        if gui:IsA("ScreenGui") and gui.Enabled and not isOurGui(gui) then
+            for _, d in ipairs(gui:GetDescendants()) do
+                if (d:IsA("TextButton") or d:IsA("ImageButton")) and not isOurGui(d) then
+                    local n  = d.Name:lower()
+                    local pn = (d.Parent and d.Parent.Name or ""):lower()
+                    if (n:find("code") or n:find("redeem") or pn:find("code") or pn:find("redeem"))
+                        and isVisibleChain(d) then
+                        btns[#btns+1] = d
+                    end
+                end
+            end
+        end
+    end
+    return btns
+end
+
+local function clickButton(btn)
+    if not btn then return false end
+    local methods = {}
+    
+    methods[#methods+1] = function() btn.MouseButton1Click:Fire() end
+    methods[#methods+1] = function() btn.Activated:Fire() end
+    
+    if typeof(firesignal) == "function" then
+        methods[#methods+1] = function() firesignal(btn.MouseButton1Click) end
+        methods[#methods+1] = function() firesignal(btn.Activated) end
+    end
+    
+    if typeof(getconns) == "function" then
+        methods[#methods+1] = function()
+            local ok, cs = pcall(getconns, btn.MouseButton1Click)
+            if ok and type(cs) == "table" then
+                for _, c in ipairs(cs) do pcall(function() c:Fire() end) end
+            end
+            local ok2, cs2 = pcall(getconns, btn.Activated)
+            if ok2 and type(cs2) == "table" then
+                for _, c in ipairs(cs2) do pcall(function() c:Fire() end) end
+            end
+        end
+    end
+    
+    if typeof(fireclick) == "function" then
+        methods[#methods+1] = function() fireclick(btn) end
+    end
+    
+    local anyOk = false
+    for _, fn in ipairs(methods) do
+        local ok = pcall(fn)
+        anyOk = anyOk or ok
+    end
+    return anyOk
+end
+
+local function fireBoxFocusLost(box)
+    if not box then return false end
+    local anyFired = false
+    
+    if typeof(firesignal) == "function" then
+        local ok = pcall(firesignal, box.FocusLost, true)
+        anyFired = anyFired or ok
+    end
+    
+    if typeof(getconns) == "function" then
+        local ok, cs = pcall(getconns, box.FocusLost)
+        if ok and type(cs) == "table" then
+            for _, c in ipairs(cs) do
+                local fn
+                pcall(function() fn = c.Function end)
+                if fn and typeof(getupvalues) == "function" and typeof(setupv) == "function" then
+                    local uOk, ups = pcall(getupvalues, fn)
+                    if uOk and type(ups) == "table" then
+                        for i, v in pairs(ups) do
+                            if type(v) == "boolean" and v == true then
+                                pcall(setupv, fn, i, false)
+                            end
+                        end
+                    end
+                end
+                local fOk = pcall(function()
+                    if c.Enabled ~= false then c:Fire(true) end
+                end)
+                anyFired = anyFired or fOk
+            end
+        end
+    end
+    
+    return anyFired
+end
+
+local function typeAndSubmitCode(code)
+    local pg = playerGui or player:FindFirstChildOfClass("PlayerGui")
+    if not pg then return false, "no PlayerGui" end
+
+    -- Strategy 1: Known UI path
+    local codesGui = pg:FindFirstChild("Codes")
+    if codesGui then
+        if codesGui:IsA("ScreenGui") then codesGui.Enabled = true end
+        local codesFrame = codesGui:FindFirstChild("Codes") or codesGui
+        if codesFrame then
+            if codesFrame:IsA("GuiObject") then codesFrame.Visible = true end
+            local cur = codesFrame
+            while cur and cur ~= codesGui do
+                if cur:IsA("GuiObject") then cur.Visible = true end
+                cur = cur.Parent
+            end
+
+            local box = nil
+            for _, d in ipairs(codesFrame:GetDescendants()) do
+                if d:IsA("TextBox") and not isOurGui(d) then
+                    box = d
+                    break
+                end
+            end
+
+            local submitBtn = nil
+            for _, d in ipairs(codesFrame:GetDescendants()) do
+                if (d:IsA("TextButton") or d:IsA("ImageButton")) and not isOurGui(d) then
+                    local n = d.Name:lower()
+                    local txt = ""
+                    pcall(function() txt = d.Text:lower() end)
+                    if n:find("submit") or txt:find("submit") or n:find("redeem") or txt:find("redeem") or n:find("claim") or txt:find("confirm") or n:find("enter") then
+                        submitBtn = d
+                        break
+                    end
+                end
+            end
+            if not submitBtn then
+                for _, d in ipairs(codesFrame:GetDescendants()) do
+                    if (d:IsA("TextButton") or d:IsA("ImageButton")) and not isOurGui(d) then
+                        local n = d.Name:lower()
+                        if not n:find("close") and not n:find("x") and not n:find("toggle") then
+                            submitBtn = d
+                            break
+                        end
+                    end
+                end
+            end
+
+            if box then
+                pcall(function() box.Text = code end)
+                task.wait(0.05)
+                if submitBtn then clickButton(submitBtn) end
+                fireBoxFocusLost(box)
+                return true, "submitted via PlayerGui.Codes"
+            end
+        end
+    end
+
+    -- Strategy 2: Dynamic Search
+    local btns = findCodeButtons(pg)
+    for _, btn in ipairs(btns) do
+        clickButton(btn)
+        task.wait(0.05)
+    end
+
+    task.wait(0.2)
+
+    local box = nil
+    local deadline = tick() + 2
+    while tick() < deadline do
+        local allBoxes = findAllTextBoxes(pg)
+        for _, d in ipairs(allBoxes) do
+            if isVisibleChain(d) then
+                local n  = d.Name:lower()
+                local pn = (d.Parent and d.Parent.Name or ""):lower()
+                if n:find("code") or pn:find("code") or n:find("redeem") or pn:find("redeem") or n:find("input") or pn:find("textbox") or n:find("enter") then
+                    box = d
+                    break
+                end
+            end
+        end
+        if not box then
+            for _, d in ipairs(allBoxes) do
+                if isVisibleChain(d) then box = d; break end
+            end
+        end
+        if box then break end
+        task.wait(0.1)
+    end
+
+    if not box then return false, "no codebox visible" end
+
+    pcall(function() box.Text = code end)
+    task.wait(0.05)
+
+    local redeemBtn = nil
+    local searchNames = {"submit","redeem","claim","confirm","enter","send","apply","ok","use","go","check"}
+    local p = box.Parent
+    for _ = 1, 8 do
+        if not p then break end
+        for _, d in ipairs(p:GetDescendants()) do
+            if (d:IsA("TextButton") or d:IsA("ImageButton")) and not isOurGui(d) and d ~= box then
+                local n = d.Name:lower()
+                local txt = ""
+                pcall(function() txt = d.Text:lower() end)
+                for _, sn in ipairs(searchNames) do
+                    if n:find(sn) or txt:find(sn) then
+                        if isVisibleChain(d) then
+                            redeemBtn = d
+                            break
+                        end
+                    end
+                end
+                if redeemBtn then break end
+            end
+        end
+        if redeemBtn then break end
+        p = p.Parent
+    end
+
+    if redeemBtn then clickButton(redeemBtn) end
+    fireBoxFocusLost(box)
+
+    return true, "submitted via dynamic search"
+end
+
+local function aceCodeBox()
+    local pg = playerGui
+    local allBoxes = findAllTextBoxes(pg)
+    for _, box in ipairs(allBoxes) do
+        if isVisibleChain(box) then return box end
+    end
+    return nil
+end
+
+-- ==================== CARD STYLE COLORS ====================
+local COL_BG    = Color3.fromRGB(10, 10, 12)
+local COL_BTN   = Color3.fromRGB(16, 17, 20)
+local COL_WHITE = Color3.fromRGB(255, 255, 255)
+local COL_TRACK = Color3.fromRGB(30, 31, 35)
+local COL_ON    = Color3.fromRGB(0, 210, 100)
+local COL_TEXT  = Color3.fromRGB(220, 220, 225)
+
+local function ApplySpinningOutline(uiGradient)
+    task.spawn(function()
+        while uiGradient and uiGradient.Parent do
+            local t = TweenService:Create(uiGradient, TweenInfo.new(3.5, Enum.EasingStyle.Linear), {Rotation = 360})
+            t:Play()
+            t.Completed:Wait()
+            uiGradient.Rotation = 0
+        end
+    end)
+end
+
+-- CLEANUP OLD GUIS --
+pcall(function()
+    for _, name in ipairs({"CardACECodeSniper", "ACECodeSniperUI", "AutoTypeCodesUI", "ACEPaste"}) do
+        local previous = game.CoreGui:FindFirstChild(name)
+        if previous then previous:Destroy() end
+        local previous2 = playerGui:FindFirstChild(name)
+        if previous2 then previous2:Destroy() end
+    end
+end)
+
+-- ==================== CARD GUI ====================
+local GUI = Instance.new("ScreenGui")
+GUI.Name = "CardACECodeSniper"
+GUI.ResetOnSpawn = false
+GUI.IgnoreGuiInset = true
+GUI.DisplayOrder = 999
+if not pcall(function() GUI.Parent = game.CoreGui end) then GUI.Parent = playerGui end
+
+local MainBorder = Instance.new("Frame")
+MainBorder.Name = "MainBorder"
+MainBorder.Size = UDim2.new(0, 210, 0, 310)
+MainBorder.Position = UDim2.new(1, -230, 0.15, 0)
+MainBorder.BackgroundColor3 = COL_WHITE
+MainBorder.BorderSizePixel = 0
+MainBorder.Active = true
+MainBorder.Parent = GUI
+Instance.new("UICorner", MainBorder).CornerRadius = UDim.new(0, 12)
+
+local MainBorderGrad = Instance.new("UIGradient")
+MainBorderGrad.Color = ColorSequence.new({
+    ColorSequenceKeypoint.new(0,   Color3.fromRGB(255, 255, 255)),
+    ColorSequenceKeypoint.new(0.3, Color3.fromRGB(15, 15, 20)),
+    ColorSequenceKeypoint.new(0.5, Color3.fromRGB(255, 255, 255)),
+    ColorSequenceKeypoint.new(0.8, Color3.fromRGB(15, 15, 20)),
+    ColorSequenceKeypoint.new(1,   Color3.fromRGB(255, 255, 255)),
+})
+MainBorderGrad.Parent = MainBorder
+ApplySpinningOutline(MainBorderGrad)
+
+local Panel = Instance.new("Frame")
+Panel.Size = UDim2.new(1, -4, 1, -4)
+Panel.Position = UDim2.new(0, 2, 0, 2)
+Panel.BackgroundColor3 = COL_BG
+Panel.BorderSizePixel = 0
+Panel.Parent = MainBorder
+Instance.new("UICorner", Panel).CornerRadius = UDim.new(0, 10)
+
+-- Header
+local HeaderMask = Instance.new("Frame")
+HeaderMask.Size = UDim2.new(1, 0, 0, 34)
+HeaderMask.BackgroundColor3 = COL_WHITE
+HeaderMask.BorderSizePixel = 0
+HeaderMask.ClipsDescendants = true
+HeaderMask.Active = true
+HeaderMask.Parent = Panel
+Instance.new("UICorner", HeaderMask).CornerRadius = UDim.new(0, 10)
+
+local HeaderFill = Instance.new("Frame")
+HeaderFill.Size = UDim2.new(1, 0, 1, -1)
+HeaderFill.BackgroundColor3 = COL_BG
+HeaderFill.BorderSizePixel = 0
+HeaderFill.Parent = HeaderMask
+Instance.new("UICorner", HeaderFill).CornerRadius = UDim.new(0, 10)
+
+local Title = Instance.new("TextLabel")
+Title.Size = UDim2.new(1, 0, 1, 0)
+Title.BackgroundTransparency = 1
+Title.Text = "Cards code sniper"
+Title.TextColor3 = COL_WHITE
+Title.Font = Enum.Font.GothamBold
+Title.TextSize = 13
+Title.Parent = HeaderFill
+
+local HeaderLineGrad = Instance.new("UIGradient")
+HeaderLineGrad.Color = ColorSequence.new({
+    ColorSequenceKeypoint.new(0,   Color3.fromRGB(255, 255, 255)),
+    ColorSequenceKeypoint.new(0.4, Color3.fromRGB(30, 32, 40)),
+    ColorSequenceKeypoint.new(1,   Color3.fromRGB(255, 255, 255)),
+})
+HeaderLineGrad.Parent = HeaderMask
+ApplySpinningOutline(HeaderLineGrad)
+
+local Content = Instance.new("Frame")
+Content.Size = UDim2.new(1, 0, 1, -38)
+Content.Position = UDim2.new(0, 0, 0, 38)
+Content.BackgroundTransparency = 1
+Content.Parent = Panel
+
+-- Toggle helper
+local function MakeToggle(labelText, y, defaultOn, onToggle)
+    local row = Instance.new("Frame")
+    row.Size = UDim2.new(1, -16, 0, 26)
+    row.Position = UDim2.new(0, 8, 0, y)
+    row.BackgroundTransparency = 1
+    row.Parent = Content
+
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(1, -44, 1, 0)
+    lbl.BackgroundTransparency = 1
+    lbl.Text = labelText
+    lbl.TextColor3 = COL_TEXT
+    lbl.Font = Enum.Font.GothamMedium
+    lbl.TextSize = 11
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.Parent = row
+
+    local ToggleBorder = Instance.new("Frame")
+    ToggleBorder.Size = UDim2.new(0, 34, 0, 18)
+    ToggleBorder.Position = UDim2.new(1, -34, 0.5, -9)
+    ToggleBorder.BackgroundColor3 = COL_WHITE
+    ToggleBorder.BorderSizePixel = 0
+    ToggleBorder.Parent = row
+    Instance.new("UICorner", ToggleBorder).CornerRadius = UDim.new(1, 0)
+
+    local ToggleGrad = Instance.new("UIGradient")
+    ToggleGrad.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0,   Color3.fromRGB(0, 255, 140)),
+        ColorSequenceKeypoint.new(0.5, Color3.fromRGB(10, 20, 30)),
+        ColorSequenceKeypoint.new(1,   Color3.fromRGB(0, 255, 140)),
+    })
+    ToggleGrad.Parent = ToggleBorder
+    ApplySpinningOutline(ToggleGrad)
+
+    local track = Instance.new("TextButton")
+    track.Size = UDim2.new(1, -2, 1, -2)
+    track.Position = UDim2.new(0, 1, 0, 1)
+    track.BackgroundColor3 = defaultOn and COL_ON or COL_TRACK
+    track.BorderSizePixel = 0
+    track.Text = ""
+    track.AutoButtonColor = false
+    track.Parent = ToggleBorder
+    Instance.new("UICorner", track).CornerRadius = UDim.new(1, 0)
+
+    local pin = Instance.new("Frame")
+    pin.Size = UDim2.new(0, 12, 0, 12)
+    pin.Position = defaultOn and UDim2.new(1, -14, 0.5, -6) or UDim2.new(0, 2, 0.5, -6)
+    pin.BackgroundColor3 = COL_WHITE
+    pin.BorderSizePixel = 0
+    pin.Parent = track
+    Instance.new("UICorner", pin).CornerRadius = UDim.new(1, 0)
+
+    local state = defaultOn
+    track.MouseButton1Click:Connect(function()
+        state = not state
+        if state then
+            TweenService:Create(track, TweenInfo.new(0.15), {BackgroundColor3 = COL_ON}):Play()
+            TweenService:Create(pin, TweenInfo.new(0.15), {Position = UDim2.new(1, -14, 0.5, -6)}):Play()
+        else
+            TweenService:Create(track, TweenInfo.new(0.15), {BackgroundColor3 = COL_TRACK}):Play()
+            TweenService:Create(pin, TweenInfo.new(0.15), {Position = UDim2.new(0, 2, 0.5, -6)}):Play()
+        end
+        if onToggle then onToggle(state) end
+    end)
+end
+
+-- Status
+local statusLabel = Instance.new("TextLabel")
+statusLabel.Size = UDim2.new(1, -16, 0, 16)
+statusLabel.Position = UDim2.new(0, 8, 0, 4)
+statusLabel.BackgroundTransparency = 1
+statusLabel.Text = _enabled and "Status: Scanning..." or "Status: OFF"
+statusLabel.TextColor3 = _enabled and COL_ON or Color3.fromRGB(120, 120, 120)
+statusLabel.Font = Enum.Font.Gotham
+statusLabel.TextSize = 11
+statusLabel.TextXAlignment = Enum.TextXAlignment.Left
+statusLabel.Parent = Content
+
+-- Toggles (same order as original, just Card style)
+MakeToggle("Code Sniper", 24, _enabled, function(state)
+    _enabled = state
+    savedConfig.codeSniper = state
+    saveConfig()
+    if not state and clearAceCapture then clearAceCapture() end
+    statusLabel.Text = state and "Status: Scanning..." or "Status: OFF"
+    statusLabel.TextColor3 = state and COL_ON or Color3.fromRGB(120, 120, 120)
+end)
+
+MakeToggle("Auto submit", 52, _autoAccept, function(state)
+    _autoAccept = state
+    savedConfig.autoSubmit = state
+    saveConfig()
+end)
+
+MakeToggle("Riddle solver", 80, _riddleSolver, function(state)
+    _riddleSolver = state
+    savedConfig.riddleSolver = state
+    saveConfig()
+end)
+
+MakeToggle("Retype invalid", 108, _retypeInvalid, function(state)
+    _retypeInvalid = state
+    savedConfig.retypeInvalid = state
+    saveConfig()
+end)
+
+-- Submit after msgs
+local DelayRow = Instance.new("Frame")
+DelayRow.Size = UDim2.new(1, -16, 0, 28)
+DelayRow.Position = UDim2.new(0, 8, 0, 140)
+DelayRow.BackgroundTransparency = 1
+DelayRow.Parent = Content
+
+local DelayLbl = Instance.new("TextLabel")
+DelayLbl.Size = UDim2.new(0, 100, 1, 0)
+DelayLbl.BackgroundTransparency = 1
+DelayLbl.Text = "Submit after msgs"
+DelayLbl.TextColor3 = COL_TEXT
+DelayLbl.Font = Enum.Font.GothamMedium
+DelayLbl.TextSize = 11
+DelayLbl.TextXAlignment = Enum.TextXAlignment.Left
+DelayLbl.Parent = DelayRow
+
+local CounterBorder = Instance.new("Frame")
+CounterBorder.Size = UDim2.new(0, 74, 0, 24)
+CounterBorder.Position = UDim2.new(1, -74, 0.5, -12)
+CounterBorder.BackgroundColor3 = COL_WHITE
+CounterBorder.BorderSizePixel = 0
+CounterBorder.Parent = DelayRow
+Instance.new("UICorner", CounterBorder).CornerRadius = UDim.new(0, 6)
+
+local CounterGrad = Instance.new("UIGradient")
+CounterGrad.Color = ColorSequence.new({
+    ColorSequenceKeypoint.new(0,   Color3.fromRGB(255, 255, 255)),
+    ColorSequenceKeypoint.new(0.4, Color3.fromRGB(20, 20, 25)),
+    ColorSequenceKeypoint.new(1,   Color3.fromRGB(255, 255, 255)),
+})
+CounterGrad.Parent = CounterBorder
+ApplySpinningOutline(CounterGrad)
+
+local CounterInner = Instance.new("Frame")
+CounterInner.Size = UDim2.new(1, -2, 1, -2)
+CounterInner.Position = UDim2.new(0, 1, 0, 1)
+CounterInner.BackgroundColor3 = COL_BTN
+CounterInner.BorderSizePixel = 0
+CounterInner.Parent = CounterBorder
+Instance.new("UICorner", CounterInner).CornerRadius = UDim.new(0, 5)
+
+local MinusBtn = Instance.new("TextButton")
+MinusBtn.Size = UDim2.new(0, 20, 1, 0)
+MinusBtn.BackgroundTransparency = 1
+MinusBtn.Text = "-"
+MinusBtn.TextColor3 = COL_WHITE
+MinusBtn.Font = Enum.Font.GothamBold
+MinusBtn.TextSize = 14
+MinusBtn.Parent = CounterInner
+
+local CountLbl = Instance.new("TextLabel")
+CountLbl.Size = UDim2.new(0, 28, 1, 0)
+CountLbl.Position = UDim2.new(0, 20, 0, 0)
+CountLbl.BackgroundTransparency = 1
+CountLbl.Text = tostring(_submitAfter)
+CountLbl.TextColor3 = COL_WHITE
+CountLbl.Font = Enum.Font.GothamBold
+CountLbl.TextSize = 12
+CountLbl.Parent = CounterInner
+
+local PlusBtn = Instance.new("TextButton")
+PlusBtn.Size = UDim2.new(0, 20, 1, 0)
+PlusBtn.Position = UDim2.new(1, -20, 0, 0)
+PlusBtn.BackgroundTransparency = 1
+PlusBtn.Text = "+"
+PlusBtn.TextColor3 = COL_WHITE
+PlusBtn.Font = Enum.Font.GothamBold
+PlusBtn.TextSize = 14
+PlusBtn.Parent = CounterInner
+
+MinusBtn.MouseButton1Click:Connect(function()
+    _submitAfter = math.max(1, _submitAfter - 1)
+    CountLbl.Text = tostring(_submitAfter)
+    savedConfig.submitAfter = _submitAfter
+    if clearAceCapture then clearAceCapture() end
+    saveConfig()
+end)
+PlusBtn.MouseButton1Click:Connect(function()
+    _submitAfter = _submitAfter + 1
+    CountLbl.Text = tostring(_submitAfter)
+    savedConfig.submitAfter = _submitAfter
+    if clearAceCapture then clearAceCapture() end
+    saveConfig()
+end)
+
+-- Log
+local LogBorder = Instance.new("Frame")
+LogBorder.Size = UDim2.new(1, -16, 0, 90)
+LogBorder.Position = UDim2.new(0, 8, 0, 178)
+LogBorder.BackgroundColor3 = COL_WHITE
+LogBorder.BorderSizePixel = 0
+LogBorder.Parent = Content
+Instance.new("UICorner", LogBorder).CornerRadius = UDim.new(0, 6)
+
+local LogGrad = Instance.new("UIGradient")
+LogGrad.Color = ColorSequence.new({
+    ColorSequenceKeypoint.new(0,   Color3.fromRGB(255, 255, 255)),
+    ColorSequenceKeypoint.new(0.3, Color3.fromRGB(15, 15, 20)),
+    ColorSequenceKeypoint.new(0.5, Color3.fromRGB(255, 255, 255)),
+    ColorSequenceKeypoint.new(0.8, Color3.fromRGB(15, 15, 20)),
+    ColorSequenceKeypoint.new(1,   Color3.fromRGB(255, 255, 255)),
+})
+LogGrad.Parent = LogBorder
+ApplySpinningOutline(LogGrad)
+
+local LogInner = Instance.new("Frame")
+LogInner.Size = UDim2.new(1, -2, 1, -2)
+LogInner.Position = UDim2.new(0, 1, 0, 1)
+LogInner.BackgroundColor3 = Color3.fromRGB(8, 8, 10)
+LogInner.BorderSizePixel = 0
+LogInner.ClipsDescendants = true
+LogInner.Parent = LogBorder
+Instance.new("UICorner", LogInner).CornerRadius = UDim.new(0, 5)
+
+local LogLabel = Instance.new("TextLabel")
+LogLabel.Size = UDim2.new(1, -8, 1, -6)
+LogLabel.Position = UDim2.new(0, 4, 0, 3)
+LogLabel.BackgroundTransparency = 1
+LogLabel.Text = _enabled and "> scanning for codes..." or "status: OFF"
+LogLabel.TextColor3 = Color3.fromRGB(140, 140, 150)
+LogLabel.Font = Enum.Font.Code
+LogLabel.TextSize = 11
+LogLabel.TextXAlignment = Enum.TextXAlignment.Left
+LogLabel.TextYAlignment = Enum.TextYAlignment.Top
+LogLabel.TextWrapped = true
+LogLabel.Parent = LogInner
+
+-- ==================== ORIGINAL LOGIC (UNTOUCHED) ====================
+
+-- AI RIDDLE SOLVER (kept fully)
+local CONFIG = {
+    PrimaryModel = "qwen",
+    BackupModel = "qwen",
+    RiddleURL = "https://sab-riddle-solver.xyrcheatz.workers.dev",
+    RiddleToken = "0facce8d7ac3a4b6fc4b6ae068b3b219883009780cb2ca31",
+    RaceModels = false,
+    Enabled = true,
+    AIRiddles = true,
+}
+
+local function httpRequest(options)
+    return HttpService:RequestAsync(options)
+end
+
+local function normalizeCode(str)
+    if not str or type(str) ~= "string" then return nil end
+    return str:match("^%s*(.-)%s*$"):upper()
+end
+
+local function aiPost(path, body)
+    if not httpRequest then return nil end
+    local ok, res = pcall(httpRequest, {
+        Url = CONFIG.RiddleURL .. path,
+        Method = "POST",
+        Headers = {
+            ["Content-Type"] = "application/json",
+            ["Authorization"] = "Bearer " .. CONFIG.RiddleToken,
+        },
+        Body = HttpService:JSONEncode(body),
+    })
+    if not ok or type(res) ~= "table" then return nil end
+    local raw = res.Body or res.body
+    if type(raw) ~= "string" then return nil end
+    local okd, data = pcall(function() return HttpService:JSONDecode(raw) end)
+    if okd and type(data) == "table" then return data end
+    return nil
+end
+
+local function submitRiddleAnswer(answer)
+    setStatus("Riddle answer: " .. answer, COL_WHITE)
+    flashCode(answer, COL_ON)
+end
+
+local solving = 0
+local lastTypedSeq = 0
+local solvedCount = 0
+
+local function logFeed(message, result, answer)
+    local icon = result == "solved" and "✅" or result == "skip" and "⏭️" or "❓"
+    local line = "[riddle] " .. icon .. " " .. message
+    if answer then line = line .. " -> " .. answer end
+    if LogLabel then LogLabel.Text = line end
+end
+
+local function solveMessage(message, seq, hist)
+    if not _riddleSolver then return end
+    solving = solving + 1
+    task.spawn(function()
+        local model = CONFIG.RaceModels and CONFIG.BackupModel or CONFIG.PrimaryModel
+        local data = aiPost("/solve", { message = message, model = model, history = hist })
+        solving = math.max(0, solving - 1)
+        if not _riddleSolver then return end
+        local top = (data and data.riddle == true and type(data.answers) == "table" and data.answers[1]) and normalizeCode(data.answers[1]) or nil
+        if top and #top > 0 and CONFIG.Enabled and CONFIG.AIRiddles and seq >= lastTypedSeq then
+            lastTypedSeq = seq
+            solvedCount = solvedCount + 1
+            submitRiddleAnswer(top)
+            logFeed(message, "solved", top)
+        elseif not top or #top == 0 then
+            logFeed(message, "skip")
+        end
+    end)
+end
+
+local function detectRiddle(message)
+    if message and message:lower():find("riddle") then
+        solveMessage(message, os.time(), {})
+    end
+end
+
+-- Status / flash (wired to Card log)
+function setStatus(msg, col)
+    if not LogLabel or not _enabled then return end
+    if msg == _lastStatusMsg then return end
+    _lastStatusMsg = msg
+    LogLabel.Text = tostring(msg)
+    if col then LogLabel.TextColor3 = col end
+end
+
+function flashCode(code, col)
+    if not code or code == "" or code == "—" then return end
+    setStatus("[code] -> " .. tostring(code), col or COL_WHITE)
+end
+
+local function resetPasteCounter() _capturedParts = {} end
+clearAceCapture = function() _capturedParts = {} end
+
+local function clearBoxWatchers()
+    if _boxTextConn then pcall(function() _boxTextConn:Disconnect() end) end
+    if _boxAncestryConn then pcall(function() _boxAncestryConn:Disconnect() end) end
+    for _, connection in ipairs(_boxVisibilityConns) do pcall(function() connection:Disconnect() end) end
+    _boxTextConn = nil
+    _boxAncestryConn = nil
+    _boxVisibilityConns = {}
+    _lastWatchedBox = nil
+end
+
+local function watchBoxForBlankReset(box)
+    if not box or _lastWatchedBox == box then return end
+    clearBoxWatchers()
+    _lastWatchedBox = box
+    if box.Text ~= "" then _lastNonBlankBoxText = box.Text end
+    _boxTextConn = box:GetPropertyChangedSignal("Text"):Connect(function()
+        if box.Text == "" then resetPasteCounter()
+        else _lastNonBlankBoxText = box.Text end
+    end)
+    _boxAncestryConn = box.AncestryChanged:Connect(function(_, parent)
+        if not parent then resetPasteCounter(); clearBoxWatchers() end
+    end)
+end
+
+UserInputService.TextBoxFocused:Connect(function(box)
+    if box:IsDescendantOf(GUI) then return end
+    if box ~= aceCodeBox() then return end
+    _focused = box
+    _lastBox = box
+    watchBoxForBlankReset(box)
+    if _enabled then setStatus("Ready", COL_ON) end
+end)
+
+UserInputService.TextBoxFocusReleased:Connect(function(box)
+    if box:IsDescendantOf(GUI) then return end
+    local codeBox = aceCodeBox()
+    if box ~= codeBox and box ~= _lastBox then return end
+    if _retypeInvalid and rememberPendingSubmission and (box == codeBox or box == _lastBox) then
+        local submittedText = box.Text ~= "" and box.Text or _lastNonBlankBoxText
+        rememberPendingSubmission(box, submittedText, false)
+    end
+    if _focused == box then
+        _focused = nil
+        if _enabled then
+            setStatus((_lastBox and _lastBox.Parent) and "Ready" or "Click code box first", (_lastBox and _lastBox.Parent) and COL_ON or Color3.fromRGB(120,120,120))
+        end
+    end
+end)
+
+clearPendingSubmission = function()
+    _pendingRejectedToken += 1
+    _pendingRejectedText = nil
+    _pendingRejectedBox = nil
+    _pendingRejectedUntil = 0
+end
+
+rememberPendingSubmission = function(box, text, replaceExisting)
+    if not _retypeInvalid or not text or text == "" then return end
+    if not replaceExisting and _pendingRejectedText and os.clock() <= _pendingRejectedUntil then return end
+    _pendingRejectedToken += 1
+    local token = _pendingRejectedToken
+    _pendingRejectedText = text
+    _pendingRejectedBox = box
+    _pendingRejectedUntil = os.clock() + 8
+    task.delay(8, function()
+        if token == _pendingRejectedToken then clearPendingSubmission() end
+    end)
+end
+
+local function restoreRejectedText(box, previousText)
+    if not _retypeInvalid or not previousText or previousText == "" then return false end
+    RunService.Heartbeat:Wait()
+    local repasteBox = aceCodeBox() or box
+    if not repasteBox or not isVisibleChain(repasteBox) then return false end
+    local restored = pcall(function() repasteBox.Text = previousText end)
+    if restored then
+        _lastBox = repasteBox
+        watchBoxForBlankReset(repasteBox)
+    end
+    return restored
+end
+
+handleRedemptionFeedback = function(text, feedbackObject)
+    if not _retypeInvalid or not _pendingRejectedText then return end
+    if os.clock() > _pendingRejectedUntil then clearPendingSubmission(); return end
+    if feedbackObject and feedbackObject:IsDescendantOf(GUI) then return end
+    local lower = tostring(text or ""):lower()
+    local rejected = lower:find("invalid code", 1, true)
+        or lower:find("code is invalid", 1, true)
+        or lower:find("expired", 1, true)
+        or lower:find("already redeemed", 1, true)
+        or lower:find("already used", 1, true)
+        or lower:find("doesn't exist", 1, true)
+        or lower:find("does not exist", 1, true)
+        or lower:find("not found", 1, true)
+        or lower:find("rejected", 1, true)
+    if not rejected then return end
+    local previousText = _pendingRejectedText
+    local previousBox = _pendingRejectedBox
+    local restored = restoreRejectedText(previousBox, previousText)
+    clearPendingSubmission()
+    if restored then
+        setStatus("Invalid - repasted: " .. previousText, Color3.fromRGB(200, 180, 100))
+        flashCode(previousText, Color3.fromRGB(255, 90, 90))
+    end
+end
+
+function appendToBox(text)
+    if not text or text == "" then return end
+    if _lastWatchedBox and not isVisibleChain(_lastWatchedBox) then
+        resetPasteCounter()
+        clearBoxWatchers()
+    end
+    local box = aceCodeBox()
+    _capturedParts[#_capturedParts + 1] = text
+    local combinedCode = table.concat(_capturedParts)
+    local capturedCount = #_capturedParts
+
+    if box then
+        _lastBox = box
+        watchBoxForBlankReset(box)
+        local boxWasFocused = UserInputService:GetFocusedTextBox() == box
+        box.Text = combinedCode
+        if boxWasFocused then
+            pcall(function()
+                local caretEnd = #combinedCode + 1
+                box.CursorPosition = caretEnd
+                box.SelectionStart = caretEnd
+            end)
+        end
+    else
+        setStatus("Captured; opening & searching UI...", Color3.fromRGB(200, 180, 100))
+    end
+
+    setStatus("Pasted " .. tostring(capturedCount) .. "/" .. tostring(_submitAfter), COL_ON)
+    flashCode(combinedCode, COL_WHITE)
+
+    if capturedCount >= _submitAfter then
+        _capturedParts = {}
+        if _autoAccept then
+            rememberPendingSubmission(box, combinedCode, true)
+            
+            local ok, statusMsg = typeAndSubmitCode(combinedCode)
+            
+            if ok then
+                setStatus("Redeemed: " .. combinedCode, COL_ON)
+            else
+                local restored = restoreRejectedText(box, combinedCode)
+                clearPendingSubmission()
+                if restored then
+                    setStatus("Invalid - repasted: " .. combinedCode, Color3.fromRGB(200, 180, 100))
+                    flashCode(combinedCode, Color3.fromRGB(255, 90, 90))
+                else
+                    setStatus("Failed: " .. tostring(statusMsg), Color3.fromRGB(255, 90, 90))
+                end
+            end
+        end
+    end
+end
+
+local function watchRedemptionFeedbackObject(obj)
+    if not (obj:IsA("TextLabel") or obj:IsA("TextButton")) then return end
+    handleRedemptionFeedback(obj.Text or "", obj)
+    obj:GetPropertyChangedSignal("Text"):Connect(function()
+        handleRedemptionFeedback(obj.Text or "", obj)
+    end)
+end
+
+for _, obj in ipairs(playerGui:GetDescendants()) do watchRedemptionFeedbackObject(obj) end
+playerGui.DescendantAdded:Connect(function(obj)
+    task.wait(0.04)
+    watchRedemptionFeedbackObject(obj)
+end)
+
+-- ANNOUNCEMENT NOTIFICATION LISTENER --
+local function resolveNotifyRemote()
+    if _G.PhiNotifyRemote then return _G.PhiNotifyRemote end
+    local Net = ReplicatedStorage:WaitForChild("Packages"):WaitForChild("Net")
+    local getinfo = debug and (debug.getinfo or debug.info)
+    if getgc and getinfo and getconnections then
+        for _, d in ipairs(Net:GetDescendants()) do
+            if d:IsA("RemoteEvent") then
+                local ok, cs = pcall(getconnections, d.OnClientEvent)
+                if ok then
+                    for _, c in ipairs(cs) do
+                        local f, fn = pcall(function() return c.Function end)
+                        if f and type(fn) == "function" then
+                            local i, info = pcall(getinfo, fn)
+                            if i and tostring(info.short_src or info.source or ""):find("NotificationController", 1, true) then
+                                return d
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return nil
+end
+
+local function aceStripRich(text)
+    if type(text) ~= "string" then return tostring(text) end
+    return (text:gsub("<[^>]->", ""))
+end
+
+local function aceTokenize(text)
+    local words = {}
+    for word in text:gmatch("[%w_]+") do
+        words[#words + 1] = word
+    end
+    return words
+end
+
+local aceCollectBuffer = {}
+local function onAceAnnouncement(...)
+    local text = aceStripRich(tostring((...) or ""))
+    text = text:match("^%s*(.-)%s*$") or ""
+    if text == "" or text:find("%s") then return end
+    
+    for _, word in ipairs(aceTokenize(text)) do
+        aceCollectBuffer[#aceCollectBuffer + 1] = word
+    end
+    
+    local parts = {}
+    for index = 1, math.min(#aceCollectBuffer, ACE_WORD_COUNT) do
+        parts[index] = aceCollectBuffer[index]
+    end
+    if #aceCollectBuffer < ACE_WORD_COUNT then return end
+    aceCollectBuffer = {}
+    
+    local captured = table.concat(parts)
+    if captured == "" or _seen[captured] then return end
+    _seen[captured] = true
+    task.delay(1.25, function() _seen[captured] = nil end)
+    appendToBox(captured)
+    
+    if _riddleSolver then
+        detectRiddle(captured)
+    end
+end
+
+local aceNotifyRemote = resolveNotifyRemote()
+local aceListenConnection
+if aceNotifyRemote then
+    if getgenv then
+        local previous = getgenv().ACECodeSniperNotifyConnection
+        if previous then pcall(function() previous:Disconnect() end) end
+    end
+    aceListenConnection = aceNotifyRemote.OnClientEvent:Connect(function(...)
+        if not _enabled then return end
+        pcall(onAceAnnouncement, ...)
+    end)
+    if getgenv then getgenv().ACECodeSniperNotifyConnection = aceListenConnection end
+end
+
+if getgenv then
+    getgenv().StopAura = function()
+        if aceListenConnection then
+            pcall(function() aceListenConnection:Disconnect() end)
+            aceListenConnection = nil
+        end
+        if getgenv().ACECodeSniperNotifyConnection then
+            pcall(function() getgenv().ACECodeSniperNotifyConnection:Disconnect() end)
+            getgenv().ACECodeSniperNotifyConnection = nil
+        end
+        if GUI then GUI:Destroy() end
+    end
+end
+
+-- Dragging
+local dragging, dragStart, startPos, dragInput = false, nil, nil, nil
+HeaderMask.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = true
+        dragStart = input.Position
+        startPos = MainBorder.Position
+        input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.End then dragging = false end
+        end)
+    end
+end)
+HeaderMask.InputChanged:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+        dragInput = input
+    end
+end)
+UserInputService.InputChanged:Connect(function(input)
+    if input == dragInput and dragging then
+        local delta = input.Position - dragStart
+        MainBorder.Position = UDim2.new(
+            startPos.X.Scale, startPos.X.Offset + delta.X,
+            startPos.Y.Scale, startPos.Y.Offset + delta.Y
+        )
+    end
+end)
+
+print("[Cards code sniper] Card GUI only | All original functions kept")
